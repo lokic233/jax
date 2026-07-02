@@ -28,6 +28,7 @@ import jax
 import jax.experimental.mosaic.gpu as mgpu
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import arith
+from jaxlib.mlir.dialects import builtin
 from jaxlib.mlir.dialects import gpu
 from jaxlib.mlir.dialects import llvm
 from jaxlib.mlir.dialects import math as mlir_math
@@ -2147,11 +2148,42 @@ class FragmentedArray:
     # If the vector originates from a slice (common after relayouts), we
     # can fuse the slicing into the conversion and reuse many
     # preprocessing ops (shifts, prmts) accross different vectors.
+    def find_slice(val: ir.Value) -> vector.ExtractStridedSliceOp | None:
+      """
+      If `val` is `ExtractStridedSliceOp` the function returns val.
+      If `val` is `UnrealizedConversionCast` the function matches a pattern of
+        preceeding layout cast pattern:
+          x: T0
+          a: T1 = unrealized_conversion_cast(x)
+          b: T0 = unrealized_conversion_cast(a)
+        and returns `x` if it's `ExtractStridedSliceOp`.
+      Returns None otherwise.
+      """
+      op = val.owner
+      if isinstance(op, vector.ExtractStridedSliceOp):
+        return op
+      if not isinstance(op, builtin.UnrealizedConversionCastOp):
+        return None
+      operands = list(op.operands)
+      results = list(op.results)
+      if len(operands) != 1:
+        return None  # Multiple operands unsupported.
+      producer = operands[0].owner
+      if not isinstance(producer, builtin.UnrealizedConversionCastOp):
+        return None  # Cannot fold a single cast.
+      in_tys = [operand.type for operand in producer.operands]
+      out_tys = [result.type for result in results]
+      if in_tys != out_tys:
+        return None  # T0 -> T1 -> T0 does not hold.
+      # pyrefly: ignore[bad-argument-type]
+      idx = results.index(val)
+      op = producer.operands[idx].owner
+      if not isinstance(op, vector.ExtractStridedSliceOp):
+        return None
+      return op
+
     regs_from_32bit_slice = (
-        isinstance(
-            _slice_op := getattr(any_reg.owner, "opview", None),
-            vector.ExtractStridedSliceOp,
-        )
+        (_slice_op := find_slice(any_reg))
         and utils.bitwidth(_slice_op.source.type) == 32
         # pyrefly: ignore[missing-attribute]
         and _slice_op.strides[0].value == 1
@@ -2343,7 +2375,7 @@ class FragmentedArray:
         # This also lets us share the right shift among more vectors.
         out_int_regs: list[ir.Value] = []
         if regs_from_32bit_slice:
-          slice_op: Any = reg.owner
+          slice_op: Any = find_slice(reg)
           slice_offset = slice_op.offsets[0].value
           reg_int = utils.bitcast(slice_op.source, i32)
           assert slice_offset % 2 == 0
@@ -2416,7 +2448,7 @@ class FragmentedArray:
         assert group_size * 4 <= 32
         int_ty = ir.IntegerType.get_signless(group_size * 4)
         if regs_from_32bit_slice:
-          slice_op: Any = reg.owner
+          slice_op: Any = find_slice(reg)
           slice_offset = slice_op.offsets[0].value
           reg_int = utils.bitcast(slice_op.source, i32)
           reg_i8 = upcast_i4_to_i8(reg_int, first_valid_nibble=slice_offset)
